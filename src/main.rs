@@ -1,9 +1,13 @@
 use anyhow::{anyhow, bail, Context, Result};
+use async_channel::Receiver;
 use chrono::{Datelike, Local};
 use clap::Parser;
+use futures_util::future::join_all;
+use indicatif::{MultiProgress, ProgressBar};
 use reqwest::{header::HeaderMap, Client};
 use serde::Deserialize;
 use serde_this_or_that::as_string;
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Deserialize)]
 struct UserInfo {
@@ -21,7 +25,7 @@ struct UserInfoRes {
     ok: i32,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[clap(author, version, about, long_about=None)]
 struct Args {
     /// 下载用户数字ID
@@ -41,16 +45,17 @@ struct Args {
     /// 下载失败重试次数
     #[clap(short, long, default_value_t = 3)]
     retry: u32,
+    /// 图片大小
+    #[clap(short, long, default_value_t = String::from("mw600"))]
+    image_type: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct ImageItem {
     pid: String,
     mid: String,
-    is_paid: bool,
     timeline_month: String,
     timeline_year: String,
-    object_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,8 +92,55 @@ async fn fetch_user_image_wall(client: &Client, uid: i64, sinceid: &str) -> Resu
     Ok(res)
 }
 
-async fn fetch_image(item: &ImageItem) -> Result<()> {
-    Ok(())
+async fn download_image_task(
+    n: u32,
+    args: Args,
+    client: Client,
+    pb: ProgressBar,
+    r: Receiver<ImageItem>,
+) {
+    while let Ok(img) = r.recv().await {
+        pb.reset();
+        pb.println(format!("Task {} Download {}", n, img.pid));
+
+        tokio::fs::create_dir_all(&img.mid).await.ok();
+        let output = format!("{}/{}.jpg", img.mid, img.pid);
+        let mut output = tokio::fs::File::create(output).await.unwrap();
+
+        'retry: for retry in 0..args.retry {
+            if retry > 0 {
+                pb.println(format!("Task {n} Download {} retry {retry}", img.pid));
+            }
+
+            if let Ok(mut res) = client
+                .get(format!(
+                    "https://wx1.sinaimg.cn/{}/{}.jpg",
+                    args.image_type, img.pid
+                ))
+                .send()
+                .await
+            {
+                if let Some(total) = res.content_length() {
+                    pb.set_length(total);
+                }
+
+                loop {
+                    match res.chunk().await {
+                        Ok(Some(chunk)) => {
+                            output.write_all(&chunk).await.unwrap();
+                            pb.inc(chunk.len() as _);
+                        }
+                        Ok(None) => {
+                            break 'retry;
+                        }
+                        Err(_) => {
+                            continue 'retry;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -97,7 +149,7 @@ async fn main() -> Result<()> {
 
     env_logger::init();
 
-    let mut args = Args::parse();
+    let args = Args::parse();
 
     let mut start_year_month: Option<(u32, u32)> = None;
     let mut end_year_month: Option<(u32, u32)> = None;
@@ -150,13 +202,26 @@ async fn main() -> Result<()> {
 
     let user = user_res.data.ok_or(anyhow!("用户信息不存在"))?.user;
     let mut sinceid = "".to_string();
-    let mut find = 0;
-    let mut download = 0;
     let mut year = Local::now().year() as u32;
     let mut month = Local::now().month();
 
-    println!("开始下载用户[{}]图片", user.screen_name);
+    let (send, recv) = async_channel::bounded(30);
 
+    let mb = MultiProgress::new();
+
+    let tasks: Vec<_> = (0..args.concurrency)
+        .map(|n| {
+            tokio::spawn(download_image_task(
+                n + 1,
+                args.clone(),
+                client.clone(),
+                mb.add(ProgressBar::new(100)),
+                recv.clone(),
+            ))
+        })
+        .collect();
+    mb.println(format!("开始下载用户[{}]图片", user.screen_name))
+        .ok();
     'get_images: loop {
         let ImageWallRes {
             ok,
@@ -166,14 +231,14 @@ async fn main() -> Result<()> {
         } = fetch_user_image_wall(&client, args.uid, &sinceid).await?;
 
         if ok != 1 {
-            println!("获取用户图片列表失败")
+            mb.println("获取用户图片列表失败").ok();
         }
 
         let data = data.unwrap();
         let images = data.list;
 
         if sinceid.is_empty() && bottom_tips_visible {
-            println!("提示: {}", bottom_tips_text);
+            mb.println(format!("提示: {}", bottom_tips_text)).ok();
         }
 
         for mut img in images {
@@ -181,7 +246,8 @@ async fn main() -> Result<()> {
                 if let Ok(m) = img.timeline_month.parse() {
                     month = m;
                 } else {
-                    println!("解析月份失败: {}", img.timeline_month);
+                    mb.println(format!("解析月份失败: {}", img.timeline_month))
+                        .ok();
                 }
             }
 
@@ -189,7 +255,8 @@ async fn main() -> Result<()> {
                 if let Ok(y) = img.timeline_year.parse() {
                     year = y;
                 } else {
-                    println!("解析年份失败: {}", img.timeline_year);
+                    mb.println(format!("解析年份失败: {}", img.timeline_year))
+                        .ok();
                 }
             }
 
@@ -213,26 +280,18 @@ async fn main() -> Result<()> {
 
             img.mid = format!("{}/{}/{}-{}", args.output, user.screen_name, year, month);
 
-            tokio::fs::create_dir_all(&img.mid).await?;
-
-            let body = client
-                .get(format!("https://wx1.sinaimg.cn/large/{}.jpg", img.pid))
-                .send()
-                .await?
-                .bytes()
-                .await?;
-
-            tokio::fs::write(format!("{}/{}.jpg", img.mid, img.pid), body).await?;
-
-            find += 1;
+            send.send(img).await.unwrap();
         }
 
-        println!("下载图片{}张", find);
         sinceid = data.since_id;
         if sinceid.is_empty() {
             break;
         }
     }
+
+    drop(send);
+
+    join_all(tasks).await;
 
     Ok(())
 }
