@@ -1,9 +1,11 @@
+use std::sync::Arc;
+
 use anyhow::{anyhow, bail, Context, Result};
 use async_channel::Receiver;
 use chrono::{Datelike, Local};
 use clap::Parser;
-use futures_util::future::join_all;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use futures_util::{future::join_all, TryFutureExt};
+use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{header::HeaderMap, Client};
 use tokio::io::AsyncWriteExt;
 
@@ -11,36 +13,43 @@ mod types;
 
 use types::*;
 
-async fn fetch_user_image_wall(client: &Client, uid: i64, sinceid: &str) -> Result<ImageWallRes> {
-    let res = client
-        .get(format!(
-            "https://weibo.com/ajax/profile/getImageWall?uid={}{}",
-            uid,
-            if sinceid.is_empty() {
-                "".to_string()
-            } else {
-                format!("&sinceid={}", sinceid)
-            }
-        ))
-        .send()
-        .await?
-        .json()
-        .await?;
+async fn fetch_user_image_wall(
+    client: &Client,
+    uid: i64,
+    sinceid: &str,
+    retry: u32,
+) -> Result<ImageWallRes> {
+    for _ in 0..retry {
+        let res = client
+            .get(format!(
+                "https://weibo.com/ajax/profile/getImageWall?uid={}{}",
+                uid,
+                if sinceid.is_empty() {
+                    "".to_string()
+                } else {
+                    format!("&sinceid={}", sinceid)
+                }
+            ))
+            .send()
+            .and_then(|res| res.json())
+            .await;
 
-    Ok(res)
+        if res.is_ok() {
+            return res.context("");
+        }
+    }
+
+    bail!("获取用户图片列表失败")
 }
 
 async fn download_image_task(
     n: u32,
     args: Args,
     client: Client,
-    pb: ProgressBar,
+    pb: Arc<ProgressBar>,
     r: Receiver<ImageItem>,
 ) {
     while let Ok(img) = r.recv().await {
-        pb.set_position(0);
-        pb.println(format!("{}", img.pid));
-
         tokio::fs::create_dir_all(&img.mid).await.ok();
         let output = format!("{}/{}.jpg", img.mid, img.pid);
         let mut output = tokio::fs::File::create(output).await.unwrap();
@@ -58,15 +67,10 @@ async fn download_image_task(
                 .send()
                 .await
             {
-                if let Some(total) = res.content_length() {
-                    pb.set_length(total);
-                }
-
                 loop {
                     match res.chunk().await {
                         Ok(Some(chunk)) => {
                             output.write_all(&chunk).await.unwrap();
-                            pb.inc(chunk.len() as _);
                         }
                         Ok(None) => {
                             break 'retry;
@@ -78,6 +82,8 @@ async fn download_image_task(
                 }
             }
         }
+
+        pb.inc(1);
     }
 }
 
@@ -141,40 +147,36 @@ async fn main() -> Result<()> {
     let mut year = Local::now().year() as u32;
     let mut month = Local::now().month();
 
-    let (send, recv) = async_channel::bounded(30);
+    let (send, recv) = async_channel::unbounded();
 
-    let mb = MultiProgress::new();
+    let pb = Arc::new(
+        ProgressBar::new(100).with_style(
+            ProgressStyle::with_template(
+                "{spinner} [{elapsed_precise}] {bar:40.cyan/blue} ({human_pos}/{human_len}) {eta_precise}",
+            )
+            .unwrap()
+            .progress_chars("##-"),
+        ),
+    );
 
     let tasks: Vec<_> = (0..args.concurrency)
         .map(|n| {
-            let pb = ProgressBar::new(100).with_style(
-                ProgressStyle::with_template(
-                    "{prefix:.bold.dim} {spinner} [{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({bytes_per_sec}), {eta} {wide_msg}",
-                )
-                .unwrap()
-                .progress_chars("##-"),
-            );
-
-            pb.set_prefix(format!("[{}/{}]", n + 1, args.concurrency));
-
             tokio::spawn(download_image_task(
                 n + 1,
                 args.clone(),
                 client.clone(),
-                mb.add(pb),
+                Arc::clone(&pb),
                 recv.clone(),
             ))
         })
         .collect();
-    mb.println(format!("开始下载用户[{}]图片", user.screen_name))
-        .ok();
     'get_images: loop {
         let ImageWallRes {
             ok,
             data,
             bottom_tips_text,
             bottom_tips_visible,
-        } = fetch_user_image_wall(&client, args.uid, &sinceid).await?;
+        } = fetch_user_image_wall(&client, args.uid, &sinceid, args.retry).await?;
 
         if ok != 1 {
             bail!("获取用户图片列表失败");
@@ -184,7 +186,7 @@ async fn main() -> Result<()> {
         let images = data.list;
 
         if sinceid.is_empty() && bottom_tips_visible {
-            mb.println(format!("提示: {}", bottom_tips_text)).ok();
+            println!("提示: {}", bottom_tips_text);
         }
 
         for mut img in images {
@@ -192,8 +194,7 @@ async fn main() -> Result<()> {
                 if let Ok(m) = img.timeline_month.parse() {
                     month = m;
                 } else {
-                    mb.println(format!("解析月份失败: {}", img.timeline_month))
-                        .ok();
+                    println!("解析月份失败: {}", img.timeline_month);
                 }
             }
 
@@ -201,8 +202,7 @@ async fn main() -> Result<()> {
                 if let Ok(y) = img.timeline_year.parse() {
                     year = y;
                 } else {
-                    mb.println(format!("解析年份失败: {}", img.timeline_year))
-                        .ok();
+                    println!("解析年份失败: {}", img.timeline_year);
                 }
             }
 
@@ -226,6 +226,7 @@ async fn main() -> Result<()> {
 
             img.mid = format!("{}/{}/{}-{}", args.output, user.screen_name, year, month);
 
+            pb.inc_length(1);
             send.send(img).await.unwrap();
         }
 
@@ -238,6 +239,12 @@ async fn main() -> Result<()> {
     drop(send);
 
     join_all(tasks).await;
+
+    println!(
+        "下载完成, 总共 {} 张图片, 耗时: {:?}",
+        pb.length().unwrap(),
+        pb.elapsed()
+    );
 
     Ok(())
 }
